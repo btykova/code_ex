@@ -1,0 +1,204 @@
+---
+title: "Отчет по проекту"
+author: "Быкова Татьяна"
+date: "06 12 2020"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+### Клиенты банка
+
+```{r include=FALSE}
+#Подключаем библиотеки
+library(RSQLite)
+library(plotly)
+library(DBI)
+library(dplyr)
+library(caret)
+library(randomForest)
+library(plotly)
+
+#Создаем соединение
+
+con <- DBI::dbConnect(SQLite(), "~/shared/minor2_2019/3-SQL/project/BankChurn.db")
+```
+
+#### Выбор сегмента
+
+Я решила подойти к пробеме оттока со стороны банка и задать вопрос: какие клиенты **наиболее важны** для банка? 
+
+Так как для проведения операций и предоставления услуг клиентам банка необходимо иметь капительные активы, он будет держаться за клиентов, хранящих в нем большие суммы, потому как свои активы банки берут из обязательств, куда и входят средства клиентов. 
+
+Для начала я рассмотрела, как в целом распределены размеры балансов среди клиентов:
+
+```{r echo=FALSE, warning=FALSE,message=FALSE}
+#для анализа баланса клиентов загружаем колонку баланса и оттока из таблицы churn
+bal <- dbGetQuery(con, "SELECT Balance, Exited FROM churn") 
+#смотрим на распределение размера баланса среди клиентов
+ggplot()+
+   geom_histogram(data = bal, mapping = aes(x=Balance), fill='#f18973')+
+   theme_bw()+
+   ggtitle('Распределение балансов клиентов')+
+   ylab('Количество клиентов')+
+   xlab('Размер баланса')
+```
+
+Чтобы подтвердить мое суждение о том, что вся сумма на счетах клиентов банка во многом состоит именно из балансов крупных клиентов, я разделила индивидов из имеющейся базы на 5 групп: отдельно вынесла людей с нулевым балансом,так как их подавляющее большинство, а оставшиеся группы выделила в соответствии с распределением ненулевого баланса по кваннтилям. В результате я построила график, который показывает, какую долю в общем балансе банка занимает каждая из категорий.
+
+```{r, warning=FALSE, echo=FALSE}
+nonzero <- bal %>% filter(Balance>0)
+
+bal$category <- ifelse(bal$Balance==0,"Zero",'')
+bal$category <- ifelse(bal$Balance>=as.numeric(quantile(nonzero$Balance)[1]) & bal$Balance<=as.numeric(quantile(nonzero$Balance)[2]),"Small Balance",bal$category)
+bal$category <- ifelse(bal$Balance>as.numeric(quantile(nonzero$Balance)[2]) & bal$Balance<=as.numeric(quantile(nonzero$Balance)[3]) ,"Medium Balance",bal$category)
+bal$category <- ifelse(bal$Balance>as.numeric(quantile(nonzero$Balance)[3]) & bal$Balance<=as.numeric(quantile(nonzero$Balance)[4]) ,"Higher Balance",bal$category)
+bal$category <- ifelse(bal$Balance>as.numeric(quantile(nonzero$Balance)[4]) & bal$Balance<=as.numeric(quantile(nonzero$Balance)[5]) ,"The highest Balance",bal$category)
+
+fig <- plot_ly(
+  labels = c("Total", "Zero Balance", "Small Balance", "Medium Balance", "Higher Balance", "The highest Balance"),
+  parents = c("", "Total", "Total", "Total", "Total", "Total"),
+  values = c(sum(bal$Balance),
+             sum(bal$Balance[bal$category == "Zero Balance"]),
+             sum(bal$Balance[bal$category == "Small Balance"]),
+             sum(bal$Balance[bal$category == "Medium Balance"]),
+             sum(bal$Balance[bal$category == "Higher Balance"]),
+             sum(bal$Balance[bal$category == "The highest Balance"])),
+  type = 'sunburst',
+  branchvalues = 'total'
+)
+fig %>% layout(title = 'Распределение счетов разного размера в общем балансе банка')
+```
+
+На грфафике видно, что большую часть полной суммы составлют балансы клиентов из групп *The highest Balance* и *Higher Balance*.
+
+В целом размер балансов распределен так, что больше четверти клиентов имеют нулевые счеты, и лишь четверть переходит за границу выше 127 тысяч евро. Так, в исследуемый мной сегмент я включила людей с балансом больше третьего квартиля, которые и формируют почти половину общего баланса банка.
+
+```{r, warning=FALSE, echo=FALSE, results = 'asis'}
+high <- as.data.frame(t(data.frame(quantile(bal$Balance))))
+rownames(high) <- NULL
+
+#quantile(bal$Balance)[3] - эта команда нужна была для определения границы баланса, по которой будет проходить сегмент, вытаскивающийся из базы SQL
+
+datahigh = dbGetQuery(con, "SELECT CustomerId,  CreditScore, CountryId, Gender, Age, Tenure, Balance, NumOfProducts, HasCrCard, IsActiveMember, EstimatedSalary, Exited FROM churn
+WHERE Balance >= 127644.24 ")
+knitr::kable(high, caption = 'Распределение балансов по квартилям')
+```
+
+#### Исследование оттока в сегменте
+
+Для начала посмотрим на отток клиентов, характерный для всего датасета: 
+
+```{r, warning=FALSE, echo=FALSE}
+all = dbGetQuery(con, "SELECT Exited, COUNT() AS n FROM churn GROUP BY Exited")
+dbDisconnect(con)
+all$Exited <- ifelse(all$Exited==1,"Клиент ушел","Клиент остался")
+ggplot(all) + 
+   geom_bar(aes(x = Exited, y = n), stat = "identity", fill='#f18973')+
+   theme_bw()+
+   ggtitle('Распределение оттока для всех клиентов банка')+
+   xlab('Статус клиента')+
+   ylab('Количество клиентов')
+```
+
+В рассматриваемом же сегменте соотношение по оттоку немного другое. Доля клиентов с высоким балансом, уходящих из банка, немного выше, чем процент оттока клиентов в целом в датасете: 
+
+```{r, warning=FALSE, echo=FALSE}
+ggplot(datahigh) + geom_bar(aes(x = Exited),fill='#bc5a45')+
+   theme_bw()+
+   ggtitle('Распределение оттока для клиентов банка с высоким балансом')+
+   xlab('Статус клиента')+
+   ylab('Количество клиентов')
+```
+
+Чтобы предсказать отток этой группы мною была построены модель случайного леса, где зависимая переменная - Exited (показатель оттока), а объясняющими выступают все показатели из таблицы churn, кроме id клиента, так как эта переменная не несёт никакой смысловой нагрузки. Показатели точности модели для тестовой и обучающей выборок оказались следующими:
+
+```{r, warning=FALSE, echo=FALSE, results = 'asis'}
+datahigh$Exited <- as.factor(datahigh$Exited)
+datahigh=datahigh %>% mutate_if(is.character, as.factor)
+set.seed(55) 
+ind = createDataPartition(datahigh$Exited, p = 0.25, list = F) 
+test = datahigh[ind,] 
+train = datahigh[-ind,]
+
+#Строим модель случайного леса
+
+set.seed(55)
+model.rf=randomForest(Exited~.-CustomerId,data=train,ntree=200, mtry=5, importance=FALSE)
+predTrain.rf = predict(model.rf, train)
+predTest.rf = predict(model.rf, test)
+accuracyTest.rf = confusionMatrix(predTest.rf, test$Exited, positive = '1')$overall["Accuracy"]
+accuracyTrain.rf = confusionMatrix(predTrain.rf, train$Exited, positive = '1')$overall["Accuracy"]
+
+SensitivityTest <- sensitivity(predTest.rf, test$Exited, positive = levels(test$Exited)[2]) #должно быть 1
+SpecificityTest <- specificity(predTest.rf, test$Exited, negative = levels(test$Exited)[1]) #должно быть 0
+AccuracyTest <- as.numeric(accuracyTest.rf)
+
+SensitivityTrain <- sensitivity(predTrain.rf, train$Exited, positive = levels(train$Exited)[1]) #должно быть 1
+SpecificityTrain <- specificity(predTrain.rf, train$Exited, negative = levels(train$Exited)[2]) #должно быть 0
+AccuracyTrain <- as.numeric(accuracyTrain.rf)
+
+Sensitivity <- round(c(SensitivityTest, SensitivityTrain),digits=2)
+Specificity <- round(c(SpecificityTest, SpecificityTrain),digits=2)
+Accuracy <- round(c(AccuracyTest, AccuracyTrain),digits=2)
+table1 <- data.frame(Sensitivity, Specificity, Accuracy)
+rownames(table1) <- c("Тестовая выборка","Обучающая выборка")
+knitr::kable(table1)
+```
+
+Так, я решила, что модель достаточно хорошо предсказывает отток.
+
+Далее, для того, чтобы понять, какие показатели могут влиять на отток, я проанализировала важность переменных в модели randomforest:
+
+```{r, warning=FALSE, echo=FALSE}
+varImpPlot(model.rf)
+```
+
+Так как банк не может повлиять ни на возраст клиента, ни на его баланс, ни на кредитный рейтинг, ни на зарплату, следующим по важности фактором является количество используемых продуктов. Я предполагаю, что при использовании большего числа продуктов клиенты будут реже уходить из банка. Тогда для решения проблемы оттока обеспеченных клиентов банку нужно будет как можно чаще проводить кампании по продвижению своих продуктов и, возможно, уникальных предложений для данного сегмента. 
+
+Так выглядит распределение по количеству используемых продуктов среди клиентов с высоким балансом:
+
+```{r, warning=FALSE, echo=FALSE}
+ggplot(datahigh) + geom_bar(aes(x = NumOfProducts), fill='#c1946a')+
+   theme_bw()+
+   xlab('Количество используемых продуктов')+
+   ylab('Количество клиентов')+
+   ggtitle('Распределение по количеству используемых продуктов \nв рассматриваемом сегменте')
+```
+
+Для уменьшения оттока попробуем изменить *NumOfProducts* на тестовой выборке. Предположим, что после успешного проведения маркетинговой кампании по продвижению новых продуктов, 30% всех клиентов с высоким балансом, которые ранее пользовалиь лишь одним продуктом, начали использовать два. 
+
+Новое распределение по количеству продуктов на тестовой выборке будет следующим:
+
+```{r, warning=FALSE, echo=FALSE}
+test.new = test
+test.new$NumOfProducts = as.numeric(test.new$NumOfProducts)
+test.new$NumOfProducts[test.new$NumOfProducts == 1] = sample(c(1, 2), 
+         size = length(test.new$NumOfProducts[test.new$NumOfProducts == 1]),
+         replace = T, prob = c(0.7, 0.3))
+
+ggplot(test.new) + geom_bar(aes(x = NumOfProducts), fill='#c1946a')+
+   theme_bw()+
+   xlab('Количество используемых продуктов')+
+   ylab('Количество клиентов')+
+   ggtitle('Распределение по количеству используемых продуктов \nв рассматриваемом сегменте')
+```
+
+Теперь посмотрим, как изменился бы отток клиентов данного сегмента на тестовой выборке после проведения предложенной мной кампании:
+
+```{r, warning=FALSE, echo=FALSE, message=FALSE}
+predTestNum = predict(model.rf, test.new)
+ggplot(test) + geom_bar(aes(x = Exited), alpha = 0.6,fill='#bc5a45') +
+  geom_bar(data = data.frame(predTestNum), aes(x = predTestNum), alpha = 0.5, fill='#ffef96')+
+   theme_bw()+
+   ggtitle('Сравнение оттока на тестовой выборке до и после \nпредложения новых продуктов')+
+   xlab('Статус клиента, где 1 - ушёл из банка')+
+   ylab('Количество клиентов')+ theme(legend.position = c(0.8, 0.2))
+```
+
+
+Таким образом, при изменении количества используемых продуктов банка, клиенты с высоким балансом становятся более склонны к тому, чтобы сохранить счет в банке. 
+
